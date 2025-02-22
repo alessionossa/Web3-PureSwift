@@ -6,9 +6,10 @@
 //
 
 import Foundation
-import secp256k1
+import EllipticCurveKit
 import CryptoSwift
 import BigInt
+import CryptoKit
 
 public final class EthereumPublicKey {
 
@@ -19,12 +20,6 @@ public final class EthereumPublicKey {
 
     /// The `EthereumAddress` associated with this public key
     public let address: EthereumAddress
-
-    /// True iff ctx should not be freed on deinit
-    private let ctxSelfManaged: Bool
-
-    /// Internal context for secp256k1 library calls
-    private let ctx: OpaquePointer
 
     // MARK: - Initialization
 
@@ -44,20 +39,10 @@ public final class EthereumPublicKey {
      *
      * - parameter publicKey: The uncompressed public key either with the header byte 0x04 or without.
      *
-     * - parameter ctx: An optional self managed context. If you have specific requirements and
-     *                  your app performs not as fast as you want it to, you can manage the
-     *                  `secp256k1_context` yourself with the public methods
-     *                  `secp256k1_default_ctx_create` and `secp256k1_default_ctx_destroy`.
-     *                  If you do this, we will not be able to free memory automatically and you
-     *                  __have__ to destroy the context yourself once your app is closed or
-     *                  you are sure it will not be used any longer. Only use this optional
-     *                  context management if you know exactly what you are doing and you really
-     *                  need it.
-     *
      * - throws: EthereumPublicKey.Error.keyMalformed if the given `publicKey` does not fulfill the requirements from above.
      *           EthereumPublicKey.Error.internalError if a secp256k1 library call or another internal call fails.
      */
-    public init(publicKey: Bytes, ctx: OpaquePointer? = nil) throws {
+    public init(publicKey: Bytes) throws {
         guard publicKey.count == 64 || publicKey.count == 65 else {
             throw Error.keyMalformed
         }
@@ -69,18 +54,6 @@ public final class EthereumPublicKey {
             publicKey.remove(at: 0)
         }
         self.rawPublicKey = publicKey
-
-        // Create context
-        let finalCtx: OpaquePointer
-        if let ctx = ctx {
-            finalCtx = ctx
-            self.ctxSelfManaged = true
-        } else {
-            let ctx = try secp256k1_default_ctx_create(errorThrowable: Error.internalError)
-            finalCtx = ctx
-            self.ctxSelfManaged = false
-        }
-        self.ctx = finalCtx
 
         // Generate associated ethereum address
         var hash = SHA3(variant: .keccak256).calculate(for: publicKey)
@@ -104,34 +77,12 @@ public final class EthereumPublicKey {
      * - parameter r: The r value of the signature.
      * - parameter s: The s value of the signature.
      *
-     * - parameter ctx: An optional self managed context. If you have specific requirements and
-     *                  your app performs not as fast as you want it to, you can manage the
-     *                  `secp256k1_context` yourself with the public methods
-     *                  `secp256k1_default_ctx_create` and `secp256k1_default_ctx_destroy`.
-     *                  If you do this, we will not be able to free memory automatically and you
-     *                  __have__ to destroy the context yourself once your app is closed or
-     *                  you are sure it will not be used any longer. Only use this optional
-     *                  context management if you know exactly what you are doing and you really
-     *                  need it.
-     *
      * - throws: EthereumPublicKey.Error.signatureMalformed if the signature is not valid or in other ways malformed.
      *           EthereumPublicKey.Error.internalError if a secp256k1 library call or another internal call fails.
      */
-    public init(message: Bytes, v: EthereumQuantity, r: EthereumQuantity, s: EthereumQuantity, ctx: OpaquePointer? = nil) throws {
+    public init(message: Bytes, v: EthereumQuantity, r: EthereumQuantity, s: EthereumQuantity) throws {
         let originalR = r
         let originalS = s
-
-        // Create context
-        let finalCtx: OpaquePointer
-        if let ctx = ctx {
-            finalCtx = ctx
-            self.ctxSelfManaged = true
-        } else {
-            let ctx = try secp256k1_default_ctx_create(errorThrowable: Error.internalError)
-            finalCtx = ctx
-            self.ctxSelfManaged = false
-        }
-        self.ctx = finalCtx
 
         // Create raw signature array
         var rawSig = Bytes()
@@ -157,37 +108,39 @@ public final class EthereumPublicKey {
         rawSig.append(contentsOf: s)
 
         // Parse recoverable signature
-        guard let recsig = malloc(MemoryLayout<secp256k1_ecdsa_recoverable_signature>.size)?.assumingMemoryBound(to: secp256k1_ecdsa_recoverable_signature.self) else {
-            throw Error.internalError
-        }
-        defer {
-            free(recsig)
-        }
-        guard secp256k1_ecdsa_recoverable_signature_parse_compact(finalCtx, recsig, &rawSig, v) == 1 else {
+        // secp256k1_ecdsa_recoverable_signature_parse_compact
+        // secp256k1_ecdsa_recoverable_signature_parse_compact(finalCtx, recsig, &rawSig, v)
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1_recovery.h#L36
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/modules/recovery/main_impl.h#L38
+        guard let signature = EllipticCurveKit.Signature<Secp256k1>(r: Number(originalR.quantity), s: Number(originalS.quantity), ensureLowSAccordingToBIP62: true) else {
             throw Error.signatureMalformed
         }
+        /*
+        guard let recoverableSignature = ECDSA<Secp256k1>.Signature(r: Number(originalR.quantity), s: Number(originalS.quantity), recoveryId: Int(v)) else {
+            throw Error.signatureMalformed
+        }
+         */
 
         // Recover public key
-        guard let pubkey = malloc(MemoryLayout<secp256k1_pubkey>.size)?.assumingMemoryBound(to: secp256k1_pubkey.self) else {
-            throw Error.internalError
-        }
-        defer {
-            free(pubkey)
-        }
-        var hash = SHA3(variant: .keccak256).calculate(for: message)
+        let hash = SHA3(variant: .keccak256).calculate(for: message)
         guard hash.count == 32 else {
             throw Error.internalError
         }
-        guard secp256k1_ecdsa_recover(finalCtx, pubkey, recsig, &hash) == 1 else {
+        // secp256k1_ecdsa_recover
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1_recovery.h#L102
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/modules/recovery/main_impl.h#L137
+        // Call to `secp256k1_ecdsa_sig_recover` https://github.com/bitcoin-core/secp256k1/blob/master/src/modules/recovery/main_impl.h#L87`
+            // Call to `secp256k1_gej_set_ge` https://github.com/bitcoin-core/secp256k1/blob/master/src/group_impl.h#L329
+                    // Call to `secp256k1_fe_set_int` https://github.com/bitcoin-core/secp256k1/blob/master/src/field_impl.h#L217
+        guard let recoveredPublicKey = ECDSA<Secp256k1>.recoverPublicKey(message: Message(rawData: hash.asData), signature: signature, recoveryParam: Int(v)) else {
             throw Error.signatureMalformed
         }
 
         // Generate uncompressed public key bytes
-        var rawPubKey = Bytes(repeating: 0, count: 65)
-        var outputlen = 65
-        guard secp256k1_ec_pubkey_serialize(finalCtx, &rawPubKey, &outputlen, pubkey, UInt32(SECP256K1_EC_UNCOMPRESSED)) == 1 else {
-            throw Error.internalError
-        }
+        // secp256k1_ec_pubkey_serialize
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1.h#L428
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/secp256k1.c#L268
+        var rawPubKey = Bytes(data: recoveredPublicKey.data.uncompressed)
 
         rawPubKey.remove(at: 0)
         self.rawPublicKey = rawPubKey
@@ -234,67 +187,59 @@ public final class EthereumPublicKey {
         // Get public key
         var rawpubKey = rawPublicKey
         rawpubKey.insert(0x04, at: 0)
-        guard let pubkey = malloc(MemoryLayout<secp256k1_pubkey>.size)?.assumingMemoryBound(to: secp256k1_pubkey.self) else {
-            throw Error.internalError
-        }
-        defer {
-            free(pubkey)
-        }
-        guard secp256k1_ec_pubkey_parse(ctx, pubkey, &rawpubKey, 65) == 1 else {
-            throw Error.keyMalformed
-        }
+        // secp256k1_ec_pubkey_parse
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1.h#L406
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/secp256k1.c#L250
+        // Call to `secp256k1_eckey_pubkey_parse` https://github.com/bitcoin-core/secp256k1/blob/master/src/eckey_impl.h#L17
+        let affinePoint = try AffinePoint<Secp256k1>.decodeFromUncompressedPublicKey(bytes: rawpubKey.asData)
+        let publicKey = PublicKey<Secp256k1>(point: affinePoint)
 
         // Create raw signature array
         var rawSig = Bytes()
-        var r = r.makeBytes().trimLeadingZeros()
-        var s = s.makeBytes().trimLeadingZeros()
+        var rBytes = r.makeBytes().trimLeadingZeros()
+        var sBytes = s.makeBytes().trimLeadingZeros()
 
-        guard r.count <= 32 && s.count <= 32 else {
+        guard rBytes.count <= 32 && sBytes.count <= 32 else {
             throw Error.signatureMalformed
         }
         guard v <= Int32.max else {
             throw Error.signatureMalformed
         }
-        let v = Int32(v)
 
-        for _ in 0..<(32 - r.count) {
-            r.insert(0, at: 0)
+        for _ in 0..<(32 - rBytes.count) {
+            rBytes.insert(0, at: 0)
         }
-        for _ in 0..<(32 - s.count) {
-            s.insert(0, at: 0)
+        for _ in 0..<(32 - sBytes.count) {
+            sBytes.insert(0, at: 0)
         }
 
-        rawSig.append(contentsOf: r)
-        rawSig.append(contentsOf: s)
+        rawSig.append(contentsOf: rBytes)
+        rawSig.append(contentsOf: sBytes)
 
         // Parse recoverable signature
-        guard let recsig = malloc(MemoryLayout<secp256k1_ecdsa_recoverable_signature>.size)?.assumingMemoryBound(to: secp256k1_ecdsa_recoverable_signature.self) else {
-            throw Error.internalError
-        }
-        defer {
-            free(recsig)
-        }
-        guard secp256k1_ecdsa_recoverable_signature_parse_compact(ctx, recsig, &rawSig, v) == 1 else {
+        // secp256k1_ecdsa_recoverable_signature_parse_compact
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1_recovery.h#L36
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/modules/recovery/main_impl.h#L38
+        
+        // Convert to normal signature
+        // secp256k1_ecdsa_recoverable_signature_convert
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1_recovery.h#L50
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/modules/recovery/main_impl.h#L74
+        
+        guard let signature = EllipticCurveKit.Signature<Secp256k1>.init(r: Number(r), s: Number(s), ensureLowSAccordingToBIP62: true) else {
             throw Error.signatureMalformed
         }
 
-        // Convert to normal signature
-        guard let sig = malloc(MemoryLayout<secp256k1_ecdsa_signature>.size)?.assumingMemoryBound(to: secp256k1_ecdsa_signature.self) else {
-            throw Error.internalError
-        }
-        defer {
-            free(sig)
-        }
-        guard secp256k1_ecdsa_recoverable_signature_convert(ctx, sig, recsig) == 1 else {
-            throw Error.internalError
-        }
-
         // Check validity with signature
-        var hash = SHA3(variant: .keccak256).calculate(for: message)
+        let hash = SHA3(variant: .keccak256).calculate(for: message)
         guard hash.count == 32 else {
             throw Error.internalError
         }
-        return secp256k1_ecdsa_verify(ctx, sig, &hash, pubkey) == 1
+        
+        // secp256k1_ecdsa_verify
+        // secp256k1_ecdsa_verify(ctx, sig, &hash, pubkey) == 1
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/src/secp256k1.c#L450
+        return ECDSA<Secp256k1>.verify(.init(rawData: hash.asData), wasSignedBy: signature, publicKey: publicKey)
     }
 
     /**
@@ -314,16 +259,8 @@ public final class EthereumPublicKey {
     private func verifyPublicKey() throws {
         var pubKey = rawPublicKey
         pubKey.insert(0x04, at: 0)
-
-        guard let result = malloc(MemoryLayout<secp256k1_pubkey>.size)?.assumingMemoryBound(to: secp256k1_pubkey.self) else {
-            throw Error.internalError
-        }
-
-        defer {
-            free(result)
-        }
-
-        guard secp256k1_ec_pubkey_parse(ctx, result, &pubKey, 65) == 1 else {
+        
+        guard ((try? AffinePoint<Secp256k1>.decodeFromUncompressedPublicKey(bytes: pubKey.asData)) != nil) else {
             throw Error.keyMalformed
         }
     }
@@ -339,11 +276,7 @@ public final class EthereumPublicKey {
 
     // MARK: - Deinitialization
 
-    deinit {
-        if !ctxSelfManaged {
-            secp256k1_context_destroy(ctx)
-        }
-    }
+    deinit { }
 }
 
 // MARK: - Equatable

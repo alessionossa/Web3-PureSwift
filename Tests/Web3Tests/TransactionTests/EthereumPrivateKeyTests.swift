@@ -70,21 +70,9 @@ class EthereumPrivateKeyTests: QuickSpec {
                     ]
                 }
 
-                // We don't destroy the context as for these tests this is not really a security problem and quite
-                // cumbersome (How do we know the tests are really finished?)
-                // It should nevertheless always be done for real applications.
-                let oCtx = try? secp256k1_default_ctx_create(errorThrowable: OwnErrors.shouldNotThrow)
-                it("should be a valid ctx pointer") {
-                    expect(oCtx).toNot(beNil())
-                }
-                guard let ctx = oCtx else {
-                    return
-                }
-
                 it("should work with own ctx") {
                     let publicKey = try? EthereumPrivateKey(
-                        hexPrivateKey: "0x026cf37c61297a451e340cdc7fbc71b6789a3b1cb27dcdc9a9a2a32c16ce2afc",
-                        ctx: ctx
+                        hexPrivateKey: "0x026cf37c61297a451e340cdc7fbc71b6789a3b1cb27dcdc9a9a2a32c16ce2afc"
                     ).publicKey
                     expect(publicKey?.rawPublicKey) == [
                         0xf8, 0x52, 0x1a, 0x0e, 0x42, 0x7d, 0xd3, 0xec, 0xd7, 0x1a, 0xf4, 0xf2, 0x17, 0xdf, 0x8f, 0xef,
@@ -96,8 +84,7 @@ class EthereumPrivateKeyTests: QuickSpec {
 
                 it("should work with own ctx twice") {
                     let publicKey = try? EthereumPrivateKey(
-                        hexPrivateKey: "0x026cf37c61297a451e340cdc7fbc71b6789a3b1cb27dcdc9a9a2a32c16ce2afc",
-                        ctx: ctx
+                        hexPrivateKey: "0x026cf37c61297a451e340cdc7fbc71b6789a3b1cb27dcdc9a9a2a32c16ce2afc"
                     ).publicKey
                     expect(publicKey?.rawPublicKey) == [
                         0xf8, 0x52, 0x1a, 0x0e, 0x42, 0x7d, 0xd3, 0xec, 0xd7, 0x1a, 0xf4, 0xf2, 0x17, 0xdf, 0x8f, 0xef,

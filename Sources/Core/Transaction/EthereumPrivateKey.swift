@@ -6,8 +6,9 @@
 //
 
 import Foundation
-import secp256k1
+import EllipticCurveKit
 import CryptoSwift
+import CryptoKit
 
 public final class EthereumPrivateKey {
 
@@ -23,12 +24,6 @@ public final class EthereumPrivateKey {
     public var address: EthereumAddress {
         return publicKey.address
     }
-
-    /// True iff ctx should not be freed on deinit
-    private let ctxSelfManaged: Bool
-
-    /// Internal context for secp256k1 library calls
-    private let ctx: OpaquePointer
 
     // MARK: - Initialization
 
@@ -81,61 +76,33 @@ public final class EthereumPrivateKey {
      *
      * - parameter privateKey: The private key bytes.
      *
-     * - parameter ctx: An optional self managed context. If you have specific requirements and
-     *                  your app performs not as fast as you want it to, you can manage the
-     *                  `secp256k1_context` yourself with the public methods
-     *                  `secp256k1_default_ctx_create` and `secp256k1_default_ctx_destroy`.
-     *                  If you do this, we will not be able to free memory automatically and you
-     *                  __have__ to destroy the context yourself once your app is closed or
-     *                  you are sure it will not be used any longer. Only use this optional
-     *                  context management if you know exactly what you are doing and you really
-     *                  need it.
-     *
      * - throws: EthereumPrivateKey.Error.keyMalformed if the restrictions described above are not met.
      *           EthereumPrivateKey.Error.internalError if a secp256k1 library call or another internal call fails.
      *           EthereumPrivateKey.Error.pubKeyGenerationFailed if the public key extraction from the private key fails.
      */
-    public init(privateKey: Bytes, ctx: OpaquePointer? = nil) throws {
+    public init(privateKey: Bytes) throws {
         guard privateKey.count == 32 else {
             throw Error.keyMalformed
         }
         self.rawPrivateKey = privateKey
 
-        let finalCtx: OpaquePointer
-        if let ctx = ctx {
-            finalCtx = ctx
-            self.ctxSelfManaged = true
-        } else {
-            let ctx = try secp256k1_default_ctx_create(errorThrowable: Error.internalError)
-            finalCtx = ctx
-            self.ctxSelfManaged = false
-        }
-        self.ctx = finalCtx
-
         // *** Generate public key ***
-        guard let pubKey = malloc(MemoryLayout<secp256k1_pubkey>.size)?.assumingMemoryBound(to: secp256k1_pubkey.self) else {
-            throw Error.internalError
+        guard let ellipticPrivateKey = PrivateKey<Secp256k1>.init(base64: privateKey.asData) else {
+            throw Error.keyMalformed
         }
-        // Cleanup
-        defer {
-            free(pubKey)
-        }
-        var secret = privateKey
-        if secp256k1_ec_pubkey_create(finalCtx, pubKey, &secret) != 1 {
-            throw Error.pubKeyGenerationFailed
-        }
-
-        var pubOut = Bytes(repeating: 0, count: 65)
-        var pubOutLen = 65
-        _ = secp256k1_ec_pubkey_serialize(finalCtx, &pubOut, &pubOutLen, pubKey, UInt32(SECP256K1_EC_UNCOMPRESSED))
-        guard pubOutLen == 65 else {
-            throw Error.pubKeyGenerationFailed
-        }
+        // secp256k1_ec_pubkey_create
+        let publicKey = PublicKey<Secp256k1>(privateKey: ellipticPrivateKey)
+        
+        // secp256k1_ec_pubkey_serialize
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/master/include/secp256k1.h#L428
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/secp256k1.c#L268
+        //   (https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/src/secp256k1.c#L268)
+        var pubOut = Bytes(data: publicKey.data.uncompressed)
 
         // First byte is header byte 0x04
         pubOut.remove(at: 0)
 
-        self.publicKey = try EthereumPublicKey(publicKey: pubOut, ctx: ctx)
+        self.publicKey = try EthereumPublicKey(publicKey: pubOut)
         // *** End Generate public key ***
 
         // Verify private key
@@ -206,7 +173,7 @@ public final class EthereumPrivateKey {
             raw.append(b)
         }
 
-        try self.init(privateKey: raw, ctx: ctx)
+        try self.init(privateKey: raw)
     }
 
     // MARK: - Convenient functions
@@ -217,33 +184,36 @@ public final class EthereumPrivateKey {
     }
 
     public func sign(hash _hash: Array<UInt8>) throws -> (v: UInt, r: Bytes, s: Bytes) {
-        var hash = _hash
+        let hash = _hash
         guard hash.count == 32 else {
             throw Error.internalError
         }
-        guard let sig = malloc(MemoryLayout<secp256k1_ecdsa_recoverable_signature>.size)?.assumingMemoryBound(to: secp256k1_ecdsa_recoverable_signature.self) else {
+                
+        guard let seckey = PrivateKey<Secp256k1>(number: rawPrivateKey.asNumber) else {
             throw Error.internalError
         }
-        defer {
-            free(sig)
-        }
-
-        var seckey = rawPrivateKey
-
-        guard secp256k1_ecdsa_sign_recoverable(ctx, sig, &hash, &seckey, nil, nil) == 1 else {
-            throw Error.internalError
-        }
-
-        var output64 = Bytes(repeating: 0, count: 64)
-        var recid: Int32 = 0
-        secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx, &output64, &recid, sig)
+        let ellipticPublicKey = PublicKey<Secp256k1>(privateKey: seckey)
+        
+        // secp256k1_ecdsa_sign_recoverable
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/include/secp256k1_recovery.h#L84
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/src/modules/recovery/main_impl.h#L123
+        // Call to `secp256k1_ecdsa_sign_inner` https://github.com/bitcoin-core/secp256k1/blob/master/src/secp256k1.c#L510
+        let (signature, recid) = ECDSA<Secp256k1>.sign(Message(rawData: hash.asData), privateKey: seckey, publicKey: ellipticPublicKey, hashFunction: SHA256())
+        
+        // .sign(Message(rawData: hash.asData), using: .init(private: ellipticPrivateKey, public: ellipticPublicKey))
+        
+        // secp256k1_ecdsa_recoverable_signature_serialize_compact
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/include/secp256k1_recovery.h#L64
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/src/modules/recovery/main_impl.h#L60
 
         guard recid == 0 || recid == 1 else {
             // Well I guess this one should never happen but to avoid bigger problems...
             throw Error.internalError
         }
-
-        return (v: UInt(recid), r: Array(output64[0..<32]), s: Array(output64[32..<64]))
+        guard Bytes(data: signature.r.as256bitLongData()).count == 32 && Bytes(data: signature.s.as256bitLongData()).count == 32 else {
+            fatalError("Incorrect")
+        }
+        return (v: UInt(recid), r: Bytes(data: signature.r.as256bitLongData()), s: Bytes(data: signature.s.as256bitLongData()))
     }
 
     /**
@@ -261,8 +231,11 @@ public final class EthereumPrivateKey {
     // MARK: - Helper functions
 
     private func verifyPrivateKey() throws {
-        var secret = rawPrivateKey
-        guard secp256k1_ec_seckey_verify(ctx, &secret) == 1 else {
+        let secret = rawPrivateKey
+        // secp256k1_ec_seckey_verify
+        // Declaration: https://github.com/bitcoin-core/secp256k1/blob/2e3bf136532e48a88baec544d485e54f7bd29db8/include/secp256k1.h#L670
+        // Implementation: https://github.com/bitcoin-core/secp256k1/blob/master/src/secp256k1.c#L580
+        guard PrivateKey<Secp256k1>(number: secret.asNumber) != nil else {
             throw Error.keyMalformed
         }
     }
@@ -278,11 +251,7 @@ public final class EthereumPrivateKey {
 
     // MARK: - Deinitialization
 
-    deinit {
-        if !ctxSelfManaged {
-            secp256k1_context_destroy(ctx)
-        }
-    }
+    deinit { }
 }
 
 // MARK: - Equatable
